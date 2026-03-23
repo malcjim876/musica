@@ -2894,16 +2894,17 @@ function toggleDrawer() {
 
 <script>
 // ============ VOZ — MOTOR UNIFICADO ============
-// Un solo AudioContext, un solo stream de micro, todo comparte la misma instancia.
+// Un solo AudioContext compartido por afinador, efectos, grabación y evaluador.
+// Los efectos en móvil SIN auriculares solo se aplican a la grabación (no al monitor
+// en directo) para evitar el bucle de feedback. Con auriculares se escuchan en tiempo real.
 
 let VOZ = {
-  ac: null,         // AudioContext único
-  stream: null,     // MediaStream del micro
-  source: null,     // MediaStreamAudioSourceNode
-  analyser: null,   // AnalyserNode para pitch
-  gainNode: null,   // Volumen principal
-  fxNodes: [],      // Cadena de efectos actual
-  dest: null,       // Destino (altavoces)
+  ac: null,           // AudioContext único — compartido con evaluador
+  stream: null,       // MediaStream del micro (reutilizado)
+  source: null,       // MediaStreamAudioSourceNode
+  analyser: null,     // AnalyserNode para pitch (fftSize 4096)
+  fxNodes: [],        // Nodos de la cadena de efectos activa
+  recDest: null,      // MediaStreamDestination para grabación con FX
   active: false,
   animFrame: null,
   recChunks: [],
@@ -2937,9 +2938,12 @@ async function toggleMic() {
 
 async function vozStart() {
   try {
-    // Reusar stream si ya existe
+    // Reusar stream si ya existe y sigue activo
     if (!VOZ.stream || !VOZ.stream.active) {
-      VOZ.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }, video: false });
+      VOZ.stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        video: false
+      });
     }
     if (!VOZ.ac || VOZ.ac.state === 'closed') {
       VOZ.ac = new (window.AudioContext || window.webkitAudioContext)();
@@ -2949,12 +2953,13 @@ async function vozStart() {
     VOZ.source = VOZ.ac.createMediaStreamSource(VOZ.stream);
     VOZ.analyser = VOZ.ac.createAnalyser();
     VOZ.analyser.fftSize = 4096;
-    VOZ.gainNode = VOZ.ac.createGain();
-    VOZ.gainNode.gain.value = 1;
 
-    // Conectar: source → analyser → fx → destino
+    // source → analyser (solo para pitch; NO conectamos al destino para evitar feedback en móvil)
     VOZ.source.connect(VOZ.analyser);
-    applyFXChain(VOZ.fx);
+
+    // Crear destino de grabación con FX aplicados
+    VOZ.recDest = VOZ.ac.createMediaStreamDestination();
+    buildFXToRecDest(VOZ.fx);
 
     VOZ.active = true;
     document.getElementById('btn-mic').textContent = 'Desactivar micro';
@@ -2962,12 +2967,11 @@ async function vozStart() {
     document.getElementById('at-meter').style.display = 'flex';
     addXP(3);
 
-    // Bucle principal: pitch + visualización
     vozLoop();
     drawViz();
     return true;
   } catch(e) {
-    alert('No se pudo acceder al micrófono. Comprueba los permisos.');
+    alert('No se pudo acceder al micrófono. Comprueba los permisos del navegador.');
     return false;
   }
 }
@@ -2975,104 +2979,131 @@ async function vozStart() {
 function vozStop() {
   VOZ.active = false;
   cancelAnimationFrame(VOZ.animFrame);
-  // No cerramos el stream ni el AC para poder reusar
   try { VOZ.source?.disconnect(); } catch(e){}
-  disconnectFX();
-}
-
-function disconnectFX() {
   VOZ.fxNodes.forEach(n => { try { n.disconnect(); } catch(e){} });
   VOZ.fxNodes = [];
 }
 
-// ---- CADENA DE EFECTOS (audio a altavoces) ----
-// IMPORTANTE: usamos un MediaStreamDestination para evitar feedback.
-// El audio procesado sale por altavoces SOLO si hay auriculares.
-// En móvil sin auriculares el efecto se nota en la grabación, no en directo (limitación del navegador).
-
-function applyFXChain(fxName) {
-  disconnectFX();
-  if (!VOZ.ac || !VOZ.source || !VOZ.analyser) return;
+// ---- CADENA DE EFECTOS (solo para grabación) ----
+// buildFXToRecDest: construye la cadena source→[fx]→recDest
+// En móvil sin auriculares NO conectamos al AC.destination para evitar feedback.
+// El alumno escucha el efecto al reproducir la grabación.
+function buildFXToRecDest(fxName) {
+  // Desconectar cadena anterior
+  VOZ.fxNodes.forEach(n => { try { n.disconnect(); } catch(e){} });
+  VOZ.fxNodes = [];
+  if (!VOZ.ac || !VOZ.source || !VOZ.recDest) return;
   VOZ.fx = fxName;
 
   const ac = VOZ.ac;
-  const dest = ac.destination;
+  const out = VOZ.recDest; // grabación con FX
   const nodes = [];
 
-  // Siempre conectamos analyser para pitch detection
-  // La cadena de FX va: analyser → [efectos] → dest
-
   if (fxName === 'normal') {
-    VOZ.analyser.connect(dest);
-    nodes.push(VOZ.analyser);
+    VOZ.source.connect(out);
+    nodes.push(out);
 
   } else if (fxName === 'eco') {
     const delay = ac.createDelay(1.5); delay.delayTime.value = 0.35;
-    const fb = ac.createGain(); fb.gain.value = 0.45;
+    const fb = ac.createGain(); fb.gain.value = 0.42;
     const dry = ac.createGain(); dry.gain.value = 0.8;
     const wet = ac.createGain(); wet.gain.value = 0.5;
-    VOZ.analyser.connect(dry); dry.connect(dest);
-    VOZ.analyser.connect(delay); delay.connect(fb); fb.connect(delay);
-    delay.connect(wet); wet.connect(dest);
+    VOZ.source.connect(dry); dry.connect(out);
+    VOZ.source.connect(delay); delay.connect(fb); fb.connect(delay);
+    delay.connect(wet); wet.connect(out);
     nodes.push(dry, wet, delay, fb);
 
   } else if (fxName === 'reverb') {
     const conv = ac.createConvolver();
-    const len = ac.sampleRate * 2;
+    const len = ac.sampleRate * 2.5;
     const imp = ac.createBuffer(2, len, ac.sampleRate);
-    for (let ch=0;ch<2;ch++) { const d=imp.getChannelData(ch); for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/len,2); }
+    for (let ch=0;ch<2;ch++) {
+      const d = imp.getChannelData(ch);
+      for (let i=0;i<len;i++) d[i] = (Math.random()*2-1)*Math.pow(1-i/len, 2.5);
+    }
     conv.buffer = imp;
-    const dry = ac.createGain(); dry.gain.value = 0.7;
-    const wet = ac.createGain(); wet.gain.value = 0.45;
-    VOZ.analyser.connect(dry); dry.connect(dest);
-    VOZ.analyser.connect(conv); conv.connect(wet); wet.connect(dest);
+    const dry = ac.createGain(); dry.gain.value = 0.65;
+    const wet = ac.createGain(); wet.gain.value = 0.5;
+    VOZ.source.connect(dry); dry.connect(out);
+    VOZ.source.connect(conv); conv.connect(wet); wet.connect(out);
     nodes.push(dry, wet, conv);
 
   } else if (fxName === 'robot') {
     const wave = ac.createWaveShaper();
     const curve = new Float32Array(256);
-    for (let i=0;i<256;i++) curve[i] = i<128?-1:1;
+    for (let i=0;i<256;i++) curve[i] = i < 128 ? -1 : 1;
     wave.curve = curve;
-    const ring = ac.createGain(); ring.gain.value = 0.6;
-    VOZ.analyser.connect(wave); wave.connect(ring); ring.connect(dest);
-    nodes.push(wave, ring);
+    const g = ac.createGain(); g.gain.value = 0.6;
+    VOZ.source.connect(wave); wave.connect(g); g.connect(out);
+    nodes.push(wave, g);
 
   } else if (fxName === 'coro') {
-    const d1=ac.createDelay(); d1.delayTime.value=0.022;
-    const d2=ac.createDelay(); d2.delayTime.value=0.048;
-    const g1=ac.createGain(); g1.gain.value=0.4;
-    const g2=ac.createGain(); g2.gain.value=0.4;
-    const dry=ac.createGain(); dry.gain.value=0.7;
-    VOZ.analyser.connect(dry); dry.connect(dest);
-    VOZ.analyser.connect(d1); d1.connect(g1); g1.connect(dest);
-    VOZ.analyser.connect(d2); d2.connect(g2); g2.connect(dest);
-    nodes.push(dry,d1,d2,g1,g2);
+    const d1 = ac.createDelay(); d1.delayTime.value = 0.022;
+    const d2 = ac.createDelay(); d2.delayTime.value = 0.048;
+    const g1 = ac.createGain(); g1.gain.value = 0.4;
+    const g2 = ac.createGain(); g2.gain.value = 0.4;
+    const dry = ac.createGain(); dry.gain.value = 0.7;
+    VOZ.source.connect(dry); dry.connect(out);
+    VOZ.source.connect(d1); d1.connect(g1); g1.connect(out);
+    VOZ.source.connect(d2); d2.connect(g2); g2.connect(out);
+    nodes.push(dry, d1, d2, g1, g2);
 
   } else if (fxName === 'grave') {
-    const f = ac.createBiquadFilter(); f.type='lowshelf'; f.frequency.value=300; f.gain.value=14;
+    const f1 = ac.createBiquadFilter(); f1.type='lowshelf'; f1.frequency.value=300; f1.gain.value=14;
     const f2 = ac.createBiquadFilter(); f2.type='highshelf'; f2.frequency.value=3000; f2.gain.value=-8;
-    VOZ.analyser.connect(f); f.connect(f2); f2.connect(dest);
-    nodes.push(f, f2);
+    VOZ.source.connect(f1); f1.connect(f2); f2.connect(out);
+    nodes.push(f1, f2);
 
   } else if (fxName === 'agudo') {
-    const f = ac.createBiquadFilter(); f.type='highshelf'; f.frequency.value=2000; f.gain.value=16;
+    const f1 = ac.createBiquadFilter(); f1.type='highshelf'; f1.frequency.value=2000; f1.gain.value=16;
     const f2 = ac.createBiquadFilter(); f2.type='lowshelf'; f2.frequency.value=200; f2.gain.value=-6;
-    VOZ.analyser.connect(f); f.connect(f2); f2.connect(dest);
-    nodes.push(f, f2);
+    VOZ.source.connect(f1); f1.connect(f2); f2.connect(out);
+    nodes.push(f1, f2);
 
   } else if (fxName === 'autotune') {
     const comp = ac.createDynamicsCompressor();
     comp.threshold.value=-18; comp.ratio.value=8; comp.attack.value=0.003; comp.release.value=0.1;
     const f = ac.createBiquadFilter(); f.type='bandpass'; f.frequency.value=800; f.Q.value=0.5;
-    VOZ.analyser.connect(comp); comp.connect(f); f.connect(dest);
+    VOZ.source.connect(comp); comp.connect(f); f.connect(out);
     nodes.push(comp, f);
 
   } else {
-    VOZ.analyser.connect(dest);
-    nodes.push(VOZ.analyser);
+    VOZ.source.connect(out);
+    nodes.push(out);
   }
 
   VOZ.fxNodes = nodes;
+}
+
+// ---- DETECCIÓN DE PITCH ----
+function autoCorrelate(buf, sampleRate) {
+  let SIZE = buf.length, rms = 0;
+  for (let i=0;i<SIZE;i++) rms += buf[i]*buf[i];
+  rms = Math.sqrt(rms/SIZE);
+  if (rms < 0.01) return -1;
+  let r1=0, r2=SIZE-1, thres=0.2;
+  for (let i=0;i<SIZE/2;i++) if (Math.abs(buf[i])<thres){r1=i;break;}
+  for (let i=1;i<SIZE/2;i++) if (Math.abs(buf[SIZE-i])<thres){r2=SIZE-i;break;}
+  buf = buf.slice(r1, r2);
+  SIZE = buf.length;
+  const c = new Array(SIZE).fill(0);
+  for (let i=0;i<SIZE;i++) for (let j=0;j<SIZE-i;j++) c[i]+=buf[j]*buf[j+i];
+  let d=0; while (c[d]>c[d+1]) d++;
+  let maxval=-1, maxpos=-1;
+  for (let i=d;i<SIZE;i++) if (c[i]>maxval){maxval=c[i];maxpos=i;}
+  let T0=maxpos;
+  const x1=c[T0-1], x2=c[T0], x3=c[T0+1];
+  const a=(x1+x3-2*x2)/2, b=(x3-x1)/2;
+  if (a) T0 -= b/(2*a);
+  return sampleRate/T0;
+}
+
+function freqToNote(freq) {
+  const noteNum = 12*(Math.log(freq/440)/Math.log(2));
+  const note = ((Math.round(noteNum)%12)+12)%12;
+  const octave = Math.floor(Math.round(noteNum)/12)+4;
+  const cents = Math.round((noteNum - Math.round(noteNum))*100);
+  return { note, cents, octave };
 }
 
 // ---- PITCH LOOP ----
@@ -3155,10 +3186,10 @@ function drawViz() {
 // ---- EFECTOS ----
 function setFX(name) {
   document.querySelectorAll('.fx-btn').forEach(b=>b.classList.remove('active'));
-  const btn=document.getElementById('fx-'+name);
-  if(btn) btn.classList.add('active');
-  if(VOZ.active) applyFXChain(name);
-  else VOZ.fx=name;
+  const btn = document.getElementById('fx-'+name);
+  if (btn) btn.classList.add('active');
+  VOZ.fx = name;
+  if (VOZ.active) buildFXToRecDest(name);
   addXP(2);
 }
 
@@ -3183,33 +3214,30 @@ async function toggleRecording() {
 
 function startRecording() {
   try {
-    const dest = VOZ.ac.createMediaStreamDestination();
-    disconnectFX();
-    // Reconectar FX con salida doble: altavoces + grabación
-    const ac=VOZ.ac;
-    const fxEnd = ac.createGain(); fxEnd.gain.value=1;
-    VOZ.analyser.connect(fxEnd); fxEnd.connect(ac.destination); fxEnd.connect(dest);
-    VOZ.fxNodes.push(fxEnd);
+    // Reconstruir cadena FX→recDest con el efecto activo
+    buildFXToRecDest(VOZ.fx);
 
-    VOZ.recorder = new MediaRecorder(dest.stream);
-    VOZ.recChunks=[];
-    VOZ.recorder.ondataavailable=e=>{ if(e.data.size>0) VOZ.recChunks.push(e.data); };
-    VOZ.recorder.onstop=()=>{
-      VOZ.lastBlob=new Blob(VOZ.recChunks,{type:'audio/webm'});
-      document.getElementById('btn-save-rec').style.display='block';
+    VOZ.recorder = new MediaRecorder(VOZ.recDest.stream, { mimeType: MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : 'audio/webm' });
+    VOZ.recChunks = [];
+    VOZ.recorder.ondataavailable = e => { if (e.data.size > 0) VOZ.recChunks.push(e.data); };
+    VOZ.recorder.onstop = () => {
+      VOZ.lastBlob = new Blob(VOZ.recChunks, { type: 'audio/webm' });
+      document.getElementById('btn-save-rec').style.display = 'block';
       drawRecViz();
     };
-    VOZ.recorder.start();
-    VOZ.isRecording=true;
-    VOZ.recStart=Date.now();
+    VOZ.recorder.start(100); // chunk cada 100ms para mejor compatibilidad
+    VOZ.isRecording = true;
+    VOZ.recStart = Date.now();
     document.getElementById('rec-btn').classList.add('recording');
-    document.getElementById('rec-status').textContent='Grabando... pulsa para parar';
-    VOZ.recTimerInterval=setInterval(()=>{
-      const s=Math.floor((Date.now()-VOZ.recStart)/1000);
-      document.getElementById('rec-timer').textContent=Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
-    },500);
+    document.getElementById('rec-status').textContent = 'Grabando con efecto: ' + VOZ.fx + ' — pulsa para parar';
+    VOZ.recTimerInterval = setInterval(() => {
+      const s = Math.floor((Date.now()-VOZ.recStart)/1000);
+      document.getElementById('rec-timer').textContent = Math.floor(s/60)+':'+String(s%60).padStart(2,'0');
+    }, 500);
     addXP(5);
-  } catch(e) { alert('Error al grabar: '+e.message); }
+  } catch(e) {
+    alert('Error al iniciar grabación: ' + e.message);
+  }
 }
 
 function stopRecording() {
@@ -3257,413 +3285,9 @@ function saveRecording() {
   setTimeout(()=>document.getElementById('rec-status').textContent='Pulsa para grabar',2000);
 }
 
-let micStream = null;
-let micActive = false;
-let tunerAC = null;
-let analyserNode = null;
-let tunerAnimFrame = null;
-let autotuneActive = false;
-
-let fxAC = null;
-let fxStream = null;
-let fxSource = null;
-let fxChain = [];
-let currentFX = 'normal';
-let vizAnimFrame = null;
-let fxAnalyser = null;
-
-let mediaRecorder = null;
-let recChunks = [];
-let isRecording = false;
-let recStartTime = null;
-let recTimerInterval = null;
-let lastRecBlob = null;
-let recordings = [];
-
-const NOTE_STRINGS = ['Do','Do#','Re','Re#','Mi','Fa','Fa#','Sol','Sol#','La','La#','Si'];
-const NOTE_COLORS = {
-  afinado: '#4ecdc4',
-  casi: '#f7c44a',
-  desafinado: '#f7706a'
-};
-
-// ---- AFINADOR ----
-async function toggleMic() {
-  if (micActive) {
-    stopMic();
-  } else {
-    await startMic();
-  }
-}
-
-async function startMic() {
-  try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-    tunerAC = new (window.AudioContext || window.webkitAudioContext)();
-    analyserNode = tunerAC.createAnalyser();
-    analyserNode.fftSize = 4096;
-    const src = tunerAC.createMediaStreamSource(micStream);
-    src.connect(analyserNode);
-    micActive = true;
-    document.getElementById('btn-mic').textContent = 'Desactivar micro';
-    document.getElementById('btn-mic').style.background = 'var(--accent2)';
-    document.getElementById('at-meter').style.display = 'flex';
-    tunerLoop();
-    await startFX();
-    addXP(5);
-  } catch(e) {
-    alert('No se pudo acceder al micrófono. Comprueba los permisos del navegador.');
-  }
-}
-
-function stopMic() {
-  if (micStream) micStream.getTracks().forEach(t=>t.stop());
-  if (tunerAC) tunerAC.close();
-  if (fxAC) fxAC.close();
-  cancelAnimationFrame(tunerAnimFrame);
-  cancelAnimationFrame(vizAnimFrame);
-  micActive = false;
-  micStream = null; tunerAC = null; fxAC = null; fxSource = null;
-  document.getElementById('btn-mic').textContent = 'Activar micro';
-  document.getElementById('btn-mic').style.background = '';
-  document.getElementById('tuner-note').textContent = '—';
-  document.getElementById('tuner-note').style.color = 'var(--muted)';
-  document.getElementById('tuner-cents').textContent = 'Activa el micro para empezar';
-  document.getElementById('tuner-freq').textContent = '';
-  document.getElementById('tuner-fill').style.left = '50%';
-  document.getElementById('at-meter').style.display = 'none';
-}
-
-function tunerLoop() {
-  const buf = new Float32Array(analyserNode.fftSize);
-  analyserNode.getFloatTimeDomainData(buf);
-  const freq = autoCorrelate(buf, tunerAC ? tunerAC.sampleRate : 44100);
-  if (freq > 60) {
-    const { note, cents, octave } = freqToNote(freq);
-    const noteName = NOTE_STRINGS[note] + octave;
-    const absC = Math.abs(cents);
-    const color = absC < 10 ? NOTE_COLORS.afinado : absC < 30 ? NOTE_COLORS.casi : NOTE_COLORS.desafinado;
-    document.getElementById('tuner-note').textContent = noteName;
-    document.getElementById('tuner-note').style.color = color;
-    document.getElementById('tuner-cents').textContent = cents > 0 ? `+${cents} cents (demasiado alto)` : cents < 0 ? `${cents} cents (demasiado bajo)` : '¡Perfectamente afinado!';
-    document.getElementById('tuner-freq').textContent = `${freq.toFixed(1)} Hz`;
-    const pct = 50 + (cents / 50) * 45;
-    document.getElementById('tuner-fill').style.left = Math.max(5, Math.min(95, pct)) + '%';
-    document.getElementById('tuner-fill').style.background = color;
-    if (autotuneActive) {
-      const dot = document.getElementById('at-dot');
-      dot.className = 'autotune-dot' + (absC < 10 ? '' : ' on');
-      document.getElementById('at-label').textContent = absC < 10 ? 'Afinado correctamente' : `Corrigiendo ${Math.abs(cents)} cents...`;
-      document.getElementById('at-correction').textContent = absC < 10 ? '' : (cents > 0 ? '↓ Baja un poco' : '↑ Sube un poco');
-    }
-  } else {
-    document.getElementById('tuner-note').textContent = '—';
-    document.getElementById('tuner-note').style.color = 'var(--muted)';
-    document.getElementById('tuner-cents').textContent = 'Canta o toca para afinar...';
-    document.getElementById('tuner-freq').textContent = '';
-  }
-  tunerAnimFrame = requestAnimationFrame(tunerLoop);
-}
-
-function autoCorrelate(buf, sampleRate) {
-  let SIZE = buf.length, rms = 0;
-  for (let i=0;i<SIZE;i++) rms += buf[i]*buf[i];
-  rms = Math.sqrt(rms/SIZE);
-  if (rms < 0.01) return -1;
-  let r1=0,r2=SIZE-1,thres=0.2;
-  for (let i=0;i<SIZE/2;i++) if (Math.abs(buf[i])<thres){r1=i;break;}
-  for (let i=1;i<SIZE/2;i++) if (Math.abs(buf[SIZE-i])<thres){r2=SIZE-i;break;}
-  buf = buf.slice(r1,r2);
-  SIZE = buf.length;
-  const c = new Array(SIZE).fill(0);
-  for (let i=0;i<SIZE;i++) for (let j=0;j<SIZE-i;j++) c[i]+=buf[j]*buf[j+i];
-  let d=0; while (c[d]>c[d+1]) d++;
-  let maxval=-1,maxpos=-1;
-  for (let i=d;i<SIZE;i++) if (c[i]>maxval){maxval=c[i];maxpos=i;}
-  let T0=maxpos;
-  const x1=c[T0-1],x2=c[T0],x3=c[T0+1];
-  const a=(x1+x3-2*x2)/2, b=(x3-x1)/2;
-  if (a) T0 -= b/(2*a);
-  return sampleRate/T0;
-}
-
-function freqToNote(freq) {
-  const noteNum = 12*(Math.log(freq/440)/Math.log(2));
-  const note = Math.round(noteNum)%12;
-  const octave = Math.floor(Math.round(noteNum)/12)+4;
-  const cents = Math.round((noteNum - Math.round(noteNum))*100);
-  return { note: ((note%12)+12)%12, cents, octave };
-}
-
-function toggleAutotune() {
-  autotuneActive = !autotuneActive;
-  const btn = document.getElementById('btn-autotune');
-  btn.textContent = autotuneActive ? 'Autotune ON' : 'Autotune OFF';
-  btn.style.color = autotuneActive ? 'var(--accent3)' : 'var(--muted)';
-  btn.style.borderColor = autotuneActive ? 'rgba(78,205,196,0.5)' : '';
-  if (!autotuneActive) {
-    document.getElementById('at-dot').className = 'autotune-dot';
-    document.getElementById('at-label').textContent = 'Autotune inactivo';
-    document.getElementById('at-correction').textContent = '';
-  }
-}
-
-// ---- FX ----
-async function startFX() {
-  try {
-    fxAC = new (window.AudioContext || window.webkitAudioContext)();
-    fxStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    fxSource = fxAC.createMediaStreamSource(fxStream);
-    fxAnalyser = fxAC.createAnalyser();
-    fxAnalyser.fftSize = 1024;
-    applyFXChain('normal');
-    drawViz();
-  } catch(e) {}
-}
-
-function setFX(name) {
-  document.querySelectorAll('.fx-btn').forEach(b=>b.classList.remove('active'));
-  document.getElementById('fx-'+name).classList.add('active');
-  currentFX = name;
-  if (fxAC && fxSource) applyFXChain(name);
-  addXP(2);
-}
-
-function applyFXChain(name) {
-  if (!fxAC || !fxSource) return;
-  fxChain.forEach(n => { try { n.disconnect(); } catch(e){} });
-  fxChain = [];
-
-  const dest = fxAC.destination;
-  let lastNode = fxSource;
-
-  if (name === 'normal') {
-    fxSource.connect(fxAnalyser);
-    fxAnalyser.connect(dest);
-    fxChain = [fxAnalyser];
-    return;
-  }
-
-  if (name === 'robot') {
-    const osc = fxAC.createOscillator();
-    osc.frequency.value = 80;
-    const ringMod = fxAC.createGain();
-    const waveShaper = fxAC.createWaveShaper();
-    const curve = new Float32Array(256);
-    for (let i=0;i<256;i++) curve[i] = i<128 ? -1 : 1;
-    waveShaper.curve = curve;
-    fxSource.connect(waveShaper);
-    waveShaper.connect(fxAnalyser);
-    fxAnalyser.connect(dest);
-    osc.start();
-    fxChain = [waveShaper, fxAnalyser, osc];
-    return;
-  }
-
-  if (name === 'eco') {
-    const delay = fxAC.createDelay(1.0);
-    delay.delayTime.value = 0.35;
-    const feedback = fxAC.createGain();
-    feedback.gain.value = 0.5;
-    const dryGain = fxAC.createGain(); dryGain.gain.value = 1;
-    const wetGain = fxAC.createGain(); wetGain.gain.value = 0.6;
-    fxSource.connect(dryGain);
-    fxSource.connect(delay);
-    delay.connect(feedback);
-    feedback.connect(delay);
-    delay.connect(wetGain);
-    dryGain.connect(fxAnalyser);
-    wetGain.connect(fxAnalyser);
-    fxAnalyser.connect(dest);
-    fxChain = [delay, feedback, dryGain, wetGain, fxAnalyser];
-    return;
-  }
-
-  if (name === 'reverb') {
-    const convolver = fxAC.createConvolver();
-    const rate = fxAC.sampleRate;
-    const len = rate * 2.5;
-    const impulse = fxAC.createBuffer(2, len, rate);
-    for (let ch=0;ch<2;ch++) {
-      const d = impulse.getChannelData(ch);
-      for (let i=0;i<len;i++) d[i] = (Math.random()*2-1)*Math.pow(1-i/len,2);
-    }
-    convolver.buffer = impulse;
-    const dry = fxAC.createGain(); dry.gain.value = 0.7;
-    const wet = fxAC.createGain(); wet.gain.value = 0.5;
-    fxSource.connect(dry); fxSource.connect(convolver);
-    convolver.connect(wet);
-    dry.connect(fxAnalyser); wet.connect(fxAnalyser);
-    fxAnalyser.connect(dest);
-    fxChain = [convolver, dry, wet, fxAnalyser];
-    return;
-  }
-
-  if (name === 'grave') {
-    const pitch = fxAC.createBiquadFilter();
-    pitch.type = 'lowshelf'; pitch.frequency.value = 300; pitch.gain.value = 12;
-    const cut = fxAC.createBiquadFilter();
-    cut.type = 'highcut'; cut.frequency.value = 2000;
-    fxSource.connect(pitch); pitch.connect(fxAnalyser);
-    fxAnalyser.connect(dest);
-    fxChain = [pitch, fxAnalyser];
-    return;
-  }
-
-  if (name === 'agudo') {
-    const pitch = fxAC.createBiquadFilter();
-    pitch.type = 'highshelf'; pitch.frequency.value = 2000; pitch.gain.value = 14;
-    fxSource.connect(pitch); pitch.connect(fxAnalyser);
-    fxAnalyser.connect(dest);
-    fxChain = [pitch, fxAnalyser];
-    return;
-  }
-
-  if (name === 'coro') {
-    const d1 = fxAC.createDelay(); d1.delayTime.value = 0.025;
-    const d2 = fxAC.createDelay(); d2.delayTime.value = 0.055;
-    const g1 = fxAC.createGain(); g1.gain.value = 0.5;
-    const g2 = fxAC.createGain(); g2.gain.value = 0.5;
-    fxSource.connect(fxAnalyser);
-    fxSource.connect(d1); d1.connect(g1); g1.connect(fxAnalyser);
-    fxSource.connect(d2); d2.connect(g2); g2.connect(fxAnalyser);
-    fxAnalyser.connect(dest);
-    fxChain = [d1,d2,g1,g2,fxAnalyser];
-    return;
-  }
-
-  if (name === 'autotune') {
-    const filter = fxAC.createBiquadFilter();
-    filter.type = 'bandpass'; filter.frequency.value = 1200; filter.Q.value = 0.7;
-    const comp = fxAC.createDynamicsCompressor();
-    comp.threshold.value = -24; comp.ratio.value = 12;
-    fxSource.connect(filter); filter.connect(comp);
-    comp.connect(fxAnalyser); fxAnalyser.connect(dest);
-    fxChain = [filter, comp, fxAnalyser];
-    return;
-  }
-
-  fxSource.connect(fxAnalyser); fxAnalyser.connect(dest);
-  fxChain = [fxAnalyser];
-}
-
-function drawViz() {
-  const canvas = document.getElementById('viz-canvas');
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  canvas.width = canvas.offsetWidth * window.devicePixelRatio;
-  canvas.height = canvas.offsetHeight * window.devicePixelRatio;
-  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-  const W = canvas.offsetWidth, H = canvas.offsetHeight;
-
-  function frame() {
-    vizAnimFrame = requestAnimationFrame(frame);
-    ctx.clearRect(0,0,W,H);
-    ctx.fillStyle = '#1f1f2a';
-    ctx.fillRect(0,0,W,H);
-    if (!fxAnalyser) return;
-    const data = new Uint8Array(fxAnalyser.frequencyBinCount);
-    fxAnalyser.getByteTimeDomainData(data);
-    ctx.beginPath();
-    ctx.strokeStyle = '#7c6af7';
-    ctx.lineWidth = 2;
-    for (let i=0;i<data.length;i++) {
-      const x = (i/data.length)*W;
-      const y = ((data[i]/128)-1)*(H/2)+H/2;
-      i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
-    }
-    ctx.stroke();
-  }
-  frame();
-}
-
-// ---- GRABACIÓN ----
-async function toggleRecording() {
-  if (isRecording) {
-    stopRecording();
-  } else {
-    await startRecording();
-  }
-}
-
-async function startRecording() {
-  try {
-    if (!fxStream) fxStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(fxStream);
-    recChunks = [];
-    mediaRecorder.ondataavailable = e => { if (e.data.size>0) recChunks.push(e.data); };
-    mediaRecorder.onstop = () => {
-      lastRecBlob = new Blob(recChunks, { type: 'audio/webm' });
-      document.getElementById('btn-save-rec').style.display = 'block';
-      drawRecViz();
-    };
-    mediaRecorder.start();
-    isRecording = true;
-    recStartTime = Date.now();
-    const btn = document.getElementById('rec-btn');
-    btn.classList.add('recording');
-    document.getElementById('rec-status').textContent = 'Grabando... pulsa para parar';
-    recTimerInterval = setInterval(() => {
-      const s = Math.floor((Date.now()-recStartTime)/1000);
-      document.getElementById('rec-timer').textContent = `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
-    }, 500);
-    addXP(5);
-  } catch(e) {
-    alert('Activa el micro primero.');
-  }
-}
-
-function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-  isRecording = false;
-  clearInterval(recTimerInterval);
-  document.getElementById('rec-btn').classList.remove('recording');
-  document.getElementById('rec-status').textContent = 'Grabación lista. Guárdala con un nombre.';
-}
-
-function drawRecViz() {
-  if (!lastRecBlob) return;
-  const canvas = document.getElementById('rec-canvas');
-  const ctx = canvas.getContext('2d');
-  canvas.width = canvas.offsetWidth * window.devicePixelRatio;
-  canvas.height = canvas.offsetHeight * window.devicePixelRatio;
-  ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
-  const W = canvas.offsetWidth, H = canvas.offsetHeight;
-  ctx.fillStyle = '#1f1f2a'; ctx.fillRect(0,0,W,H);
-  const tAC = new (window.AudioContext||window.webkitAudioContext)();
-  lastRecBlob.arrayBuffer().then(ab => tAC.decodeAudioData(ab)).then(decoded => {
-    const data = decoded.getChannelData(0);
-    const step = Math.ceil(data.length/W);
-    ctx.beginPath(); ctx.strokeStyle='#4ecdc4'; ctx.lineWidth=1;
-    for (let i=0;i<W;i++) {
-      let max=0;
-      for (let j=0;j<step;j++) { const v=Math.abs(data[i*step+j]||0); if(v>max)max=v; }
-      const h = max*(H/2);
-      ctx.moveTo(i,H/2-h); ctx.lineTo(i,H/2+h);
-    }
-    ctx.stroke();
-    tAC.close();
-  }).catch(()=>{});
-}
-
-function saveRecording() {
-  if (!lastRecBlob) return;
-  const name = document.getElementById('rec-name').value.trim() || 'Grabación ' + (recordings.length+1);
-  const url = URL.createObjectURL(lastRecBlob);
-  const fx = currentFX;
-  const dur = Math.floor((Date.now()-recStartTime)/1000);
-  recordings.unshift({ name, url, fx, dur, fecha: new Date().toLocaleDateString('es-ES') });
-  renderRecList();
-  document.getElementById('btn-save-rec').style.display = 'none';
-  document.getElementById('rec-name').value = '';
-  document.getElementById('rec-status').textContent = '¡Grabación guardada!';
-  addXP(10);
-  setTimeout(()=>document.getElementById('rec-status').textContent='Pulsa para grabar',2000);
-}
-
 function renderRecList() {
   const el = document.getElementById('rec-list');
-  if (recordings.length === 0) {
+  if (!recordings.length) {
     el.innerHTML = '<div style="text-align:center;color:var(--muted);font-size:13px;padding:20px 0">Aún no tienes grabaciones guardadas</div>';
     return;
   }
@@ -3673,14 +3297,11 @@ function renderRecList() {
         <div class="rec-item-name">${r.name}</div>
         <div class="rec-item-meta">${r.fecha} · Efecto: ${r.fx} · ${r.dur}s</div>
       </div>
-      <audio controls src="${r.url}" style="height:32px;width:140px;"></audio>
-      <a href="${r.url}" download="${r.name}.webm" style="color:var(--accent1);font-size:12px;text-decoration:none;flex-shrink:0">↓</a>
+      <audio controls src="${r.url}" style="height:32px;width:130px;flex-shrink:0"></audio>
+      <a href="${r.url}" download="${r.name}.webm" style="color:var(--accent1);font-size:18px;text-decoration:none;flex-shrink:0" title="Descargar">↓</a>
     </div>
   `).join('');
 }
-
-// ============================================================
-// EVALUADOR DE CANTO
 // ============================================================
 
 let evalMode = 'nota';
@@ -4545,143 +4166,6 @@ setTimeout(()=>{ loadCancionesDB(); },150);
 </div>
 
 
-<script>
-(function() {
-  // 1. INYECTAR LA PANTALLA DEL MODO ESTUDIO
-  // Buscamos la sección "estudio" y le metemos el contenido sin tocar tu HTML original
-  const secEstudio = document.getElementById('sec-estudio');
-  if(secEstudio) {
-    secEstudio.innerHTML = `
-      <div class="section-hero hero-estructura">
-        <div class="pill-step">MODO MULTIPISTA</div>
-        <h2>Estudio de Grabación</h2>
-        <p>Graba la mezcla de tu ritmo, tu melodía y tu voz al mismo tiempo.</p>
-      </div>
-      <div class="card">
-        <div class="card-title">Grabadora Maestra</div>
-        <div style="display: flex; gap: 12px; margin-bottom: 10px;">
-          <button id="studio-record-btn" class="btn-share btn-copy" style="flex:1; background: var(--accent2);" onclick="startStudioRecording()">🔴 Grabar Todo</button>
-          <button id="studio-stop-btn" class="btn-share" style="flex:1; background: var(--surface2); color: var(--text); border:1px solid var(--border);" onclick="stopStudioRecording()" disabled>⏹️ Parar y Descargar</button>
-        </div>
-        <div class="info-box">🎧 <strong>Consejo:</strong> Ponte auriculares para grabar tu voz y que el micrófono no capte el sonido del ritmo de los altavoces.</div>
-        <button class="btn-share" id="btn-mic-estudio" style="background:var(--surface2); border:1px solid var(--accent1); color:var(--accent1);" onclick="activarMicroEstudio()">🎤 Activar Micrófono para grabar</button>
-      </div>
-    `;
-  }
 
-  // 2. CREAR EL CABLE MAESTRO Y REDIRIGIR EL SONIDO (Monkey Patching)
-  // Esto intercepta tus sonidos automáticamente sin que tengas que cambiar tu código
-  const masterGain = AC.createGain();
-  masterGain.gain.value = 0.9;
-  
-  const originalConnect = AudioNode.prototype.connect;
-  
-  // El maestro va a los altavoces
-  originalConnect.call(masterGain, AC.destination);
-  // Y también a la grabadora invisible
-  const masterDestination = AC.createMediaStreamDestination();
-  originalConnect.call(masterGain, masterDestination);
-  
-  // Magia: Todo lo que intente ir a los altavoces, lo mandamos al maestro
-  AudioNode.prototype.connect = function(...args) {
-    if (args[0] === AC.destination) {
-      return originalConnect.call(this, masterGain);
-    }
-    return originalConnect.apply(this, args);
-  };
-
-  // 3. LÓGICA DE GRABACIÓN Y DESCARGA
-  let mediaRecorder = null;
-  let recordedChunks = [];
-  
-  window.startStudioRecording = function() {
-    if(AC.state === 'suspended') AC.resume();
-    recordedChunks = [];
-    mediaRecorder = new MediaRecorder(masterDestination.stream);
-    mediaRecorder.ondataavailable = e => { if(e.data.size > 0) recordedChunks.push(e.data); };
-    mediaRecorder.onstop = () => {
-      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a'); a.href = url; 
-      a.download = 'Mi_Cancion_1ESO.webm'; 
-      a.click();
-    };
-    mediaRecorder.start();
-    
-    // Si tienes el ritmo pausado, lo arranca automáticamente
-    if (typeof togglePlay === 'function' && !isPlaying) togglePlay(); 
-    if (typeof toggleMelody === 'function' && typeof melPlaying !== 'undefined' && !melPlaying) toggleMelody();
-
-    document.getElementById('studio-record-btn').disabled = true;
-    document.getElementById('studio-record-btn').innerText = "Grabando...";
-    document.getElementById('studio-stop-btn').disabled = false;
-  };
-
-  window.stopStudioRecording = function() {
-    if (typeof togglePlay === 'function' && isPlaying) togglePlay();
-    if (typeof toggleMelody === 'function' && typeof melPlaying !== 'undefined' && melPlaying) toggleMelody();
-    
-    if(mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
-    
-    document.getElementById('studio-record-btn').disabled = false;
-    document.getElementById('studio-record-btn').innerText = "🔴 Grabar Todo";
-    document.getElementById('studio-stop-btn').disabled = true;
-  };
-
-  // 4. AÑADIR SAMPLES REALES (Batería de verdad)
-  let realSamples = {};
-  async function loadRealSamples() {
-    const urls = {
-      kick: 'https://cdn.freesound.org/previews/171/171104_2316281-lq.mp3',
-      snare: 'https://cdn.freesound.org/previews/387/387186_7255554-lq.mp3',
-      hihat: 'https://cdn.freesound.org/previews/422/422856_6306786-lq.mp3'
-    };
-    for (const [key, url] of Object.entries(urls)) {
-      try {
-        const res = await fetch(url);
-        const buf = await res.arrayBuffer();
-        realSamples[key] = await AC.decodeAudioData(buf);
-      } catch(e) {}
-    }
-  }
-  document.body.addEventListener('click', loadRealSamples, {once:true});
-
-  // Sobrescribimos tu función original suavemente
-  const oldPlayDrum = window.playDrum;
-  window.playDrum = function(type, vol=1) {
-    if (realSamples[type]) {
-      const src = AC.createBufferSource();
-      src.buffer = realSamples[type];
-      const g = AC.createGain();
-      g.gain.value = vol;
-      src.connect(g);
-      g.connect(AC.destination); // Nuestro parche lo enviará a la grabadora
-      src.start();
-    } else {
-      // Si usas palmas o congas de tu código original, siguen funcionando
-      if (oldPlayDrum) oldPlayDrum(type, vol);
-    }
-  };
-
-  // 5. MICRÓFONO DIRECTO A LA GRABADORA
-  let micStream = null;
-  window.activarMicroEstudio = async function() {
-    const btn = document.getElementById('btn-mic-estudio');
-    if (micStream) {
-      micStream.getTracks().forEach(t=>t.stop()); micStream = null;
-      btn.innerText = "🎤 Activar Micrófono para grabar";
-      btn.style.background = "var(--surface2)";
-    } else {
-      try {
-        micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        const micSource = AC.createMediaStreamSource(micStream);
-        micSource.connect(masterDestination); // Va solo a la grabadora, no a los altavoces (evita pitido)
-        btn.innerText = "🎤 Micrófono LISTO y grabando";
-        btn.style.background = "rgba(78,205,196,0.15)";
-      } catch(e) { alert("Necesitas dar permiso al micrófono."); }
-    }
-  };
-})();
-</script>
 </body>
 </html>
