@@ -2984,95 +2984,143 @@ function vozStop() {
   VOZ.fxNodes = [];
 }
 
-// ---- CADENA DE EFECTOS (solo para grabación) ----
-// buildFXToRecDest: construye la cadena source→[fx]→recDest
-// En móvil sin auriculares NO conectamos al AC.destination para evitar feedback.
-// El alumno escucha el efecto al reproducir la grabación.
+// ---- CADENA DE EFECTOS ----
+// Estrategia: grabamos el audio CRUDO (sin efecto) con MediaRecorder.
+// Al guardar, procesamos el audio crudo con OfflineAudioContext aplicando el FX
+// y guardamos el resultado ya procesado. Esto funciona igual en móvil con o sin auriculares.
 function buildFXToRecDest(fxName) {
-  // Desconectar cadena anterior
-  VOZ.fxNodes.forEach(n => { try { n.disconnect(); } catch(e){} });
-  VOZ.fxNodes = [];
-  if (!VOZ.ac || !VOZ.source || !VOZ.recDest) return;
   VOZ.fx = fxName;
+  // La cadena de grabación siempre es source → recDest (crudo)
+  // El FX se aplica offline al guardar
+  if (!VOZ.ac || !VOZ.source || !VOZ.recDest) return;
+  try { VOZ.source.disconnect(VOZ.recDest); } catch(e){}
+  VOZ.source.connect(VOZ.recDest);
+}
 
-  const ac = VOZ.ac;
-  const out = VOZ.recDest; // grabación con FX
-  const nodes = [];
+// Aplica el FX a un AudioBuffer crudo usando OfflineAudioContext
+// Devuelve una Promise<Blob> con el audio procesado en webm/wav
+async function applyFXOffline(rawBlob, fxName) {
+  if (fxName === 'normal') return rawBlob;
 
-  if (fxName === 'normal') {
-    VOZ.source.connect(out);
-    nodes.push(out);
+  const arrayBuf = await rawBlob.arrayBuffer();
+  const tmpAC = new (window.AudioContext || window.webkitAudioContext)();
+  let decoded;
+  try {
+    decoded = await tmpAC.decodeAudioData(arrayBuf);
+  } catch(e) {
+    tmpAC.close();
+    return rawBlob; // si falla la decodificación, devolver crudo
+  }
+  tmpAC.close();
 
-  } else if (fxName === 'eco') {
-    const delay = ac.createDelay(1.5); delay.delayTime.value = 0.35;
-    const fb = ac.createGain(); fb.gain.value = 0.42;
-    const dry = ac.createGain(); dry.gain.value = 0.8;
-    const wet = ac.createGain(); wet.gain.value = 0.5;
-    VOZ.source.connect(dry); dry.connect(out);
-    VOZ.source.connect(delay); delay.connect(fb); fb.connect(delay);
+  const sr = decoded.sampleRate;
+  const len = decoded.length;
+  // Añadir cola extra para reverb/eco (2 segundos)
+  const tail = fxName === 'reverb' ? sr * 2.5 : fxName === 'eco' ? sr * 1.5 : 0;
+  const oac = new OfflineAudioContext(decoded.numberOfChannels, len + tail, sr);
+
+  const src = oac.createBufferSource();
+  src.buffer = decoded;
+
+  // Construir cadena FX en el OfflineAudioContext
+  const out = oac.destination;
+
+  if (fxName === 'eco') {
+    const delay = oac.createDelay(1.5); delay.delayTime.value = 0.35;
+    const fb = oac.createGain(); fb.gain.value = 0.42;
+    const dry = oac.createGain(); dry.gain.value = 0.8;
+    const wet = oac.createGain(); wet.gain.value = 0.5;
+    src.connect(dry); dry.connect(out);
+    src.connect(delay); delay.connect(fb); fb.connect(delay);
     delay.connect(wet); wet.connect(out);
-    nodes.push(dry, wet, delay, fb);
 
   } else if (fxName === 'reverb') {
-    const conv = ac.createConvolver();
-    const len = ac.sampleRate * 2.5;
-    const imp = ac.createBuffer(2, len, ac.sampleRate);
+    const conv = oac.createConvolver();
+    const impLen = sr * 2.5;
+    const imp = oac.createBuffer(2, impLen, sr);
     for (let ch=0;ch<2;ch++) {
       const d = imp.getChannelData(ch);
-      for (let i=0;i<len;i++) d[i] = (Math.random()*2-1)*Math.pow(1-i/len, 2.5);
+      for (let i=0;i<impLen;i++) d[i] = (Math.random()*2-1)*Math.pow(1-i/impLen, 2.5);
     }
     conv.buffer = imp;
-    const dry = ac.createGain(); dry.gain.value = 0.65;
-    const wet = ac.createGain(); wet.gain.value = 0.5;
-    VOZ.source.connect(dry); dry.connect(out);
-    VOZ.source.connect(conv); conv.connect(wet); wet.connect(out);
-    nodes.push(dry, wet, conv);
+    const dry = oac.createGain(); dry.gain.value = 0.65;
+    const wet = oac.createGain(); wet.gain.value = 0.5;
+    src.connect(dry); dry.connect(out);
+    src.connect(conv); conv.connect(wet); wet.connect(out);
 
   } else if (fxName === 'robot') {
-    const wave = ac.createWaveShaper();
+    const wave = oac.createWaveShaper();
     const curve = new Float32Array(256);
     for (let i=0;i<256;i++) curve[i] = i < 128 ? -1 : 1;
     wave.curve = curve;
-    const g = ac.createGain(); g.gain.value = 0.6;
-    VOZ.source.connect(wave); wave.connect(g); g.connect(out);
-    nodes.push(wave, g);
+    const g = oac.createGain(); g.gain.value = 0.6;
+    src.connect(wave); wave.connect(g); g.connect(out);
 
   } else if (fxName === 'coro') {
-    const d1 = ac.createDelay(); d1.delayTime.value = 0.022;
-    const d2 = ac.createDelay(); d2.delayTime.value = 0.048;
-    const g1 = ac.createGain(); g1.gain.value = 0.4;
-    const g2 = ac.createGain(); g2.gain.value = 0.4;
-    const dry = ac.createGain(); dry.gain.value = 0.7;
-    VOZ.source.connect(dry); dry.connect(out);
-    VOZ.source.connect(d1); d1.connect(g1); g1.connect(out);
-    VOZ.source.connect(d2); d2.connect(g2); g2.connect(out);
-    nodes.push(dry, d1, d2, g1, g2);
+    const d1 = oac.createDelay(); d1.delayTime.value = 0.022;
+    const d2 = oac.createDelay(); d2.delayTime.value = 0.048;
+    const g1 = oac.createGain(); g1.gain.value = 0.4;
+    const g2 = oac.createGain(); g2.gain.value = 0.4;
+    const dry = oac.createGain(); dry.gain.value = 0.7;
+    src.connect(dry); dry.connect(out);
+    src.connect(d1); d1.connect(g1); g1.connect(out);
+    src.connect(d2); d2.connect(g2); g2.connect(out);
 
   } else if (fxName === 'grave') {
-    const f1 = ac.createBiquadFilter(); f1.type='lowshelf'; f1.frequency.value=300; f1.gain.value=14;
-    const f2 = ac.createBiquadFilter(); f2.type='highshelf'; f2.frequency.value=3000; f2.gain.value=-8;
-    VOZ.source.connect(f1); f1.connect(f2); f2.connect(out);
-    nodes.push(f1, f2);
+    const f1 = oac.createBiquadFilter(); f1.type='lowshelf'; f1.frequency.value=300; f1.gain.value=14;
+    const f2 = oac.createBiquadFilter(); f2.type='highshelf'; f2.frequency.value=3000; f2.gain.value=-8;
+    src.connect(f1); f1.connect(f2); f2.connect(out);
 
   } else if (fxName === 'agudo') {
-    const f1 = ac.createBiquadFilter(); f1.type='highshelf'; f1.frequency.value=2000; f1.gain.value=16;
-    const f2 = ac.createBiquadFilter(); f2.type='lowshelf'; f2.frequency.value=200; f2.gain.value=-6;
-    VOZ.source.connect(f1); f1.connect(f2); f2.connect(out);
-    nodes.push(f1, f2);
+    const f1 = oac.createBiquadFilter(); f1.type='highshelf'; f1.frequency.value=2000; f1.gain.value=16;
+    const f2 = oac.createBiquadFilter(); f2.type='lowshelf'; f2.frequency.value=200; f2.gain.value=-6;
+    src.connect(f1); f1.connect(f2); f2.connect(out);
 
   } else if (fxName === 'autotune') {
-    const comp = ac.createDynamicsCompressor();
+    const comp = oac.createDynamicsCompressor();
     comp.threshold.value=-18; comp.ratio.value=8; comp.attack.value=0.003; comp.release.value=0.1;
-    const f = ac.createBiquadFilter(); f.type='bandpass'; f.frequency.value=800; f.Q.value=0.5;
-    VOZ.source.connect(comp); comp.connect(f); f.connect(out);
-    nodes.push(comp, f);
+    const f = oac.createBiquadFilter(); f.type='bandpass'; f.frequency.value=800; f.Q.value=0.5;
+    src.connect(comp); comp.connect(f); f.connect(out);
 
   } else {
-    VOZ.source.connect(out);
-    nodes.push(out);
+    src.connect(out);
   }
 
-  VOZ.fxNodes = nodes;
+  src.start(0);
+  const rendered = await oac.startRendering();
+
+  // Convertir AudioBuffer a WAV (compatible con todos los móviles)
+  const wavBlob = audioBufferToWav(rendered);
+  return wavBlob;
+}
+
+// Convierte AudioBuffer a Blob WAV
+function audioBufferToWav(buffer) {
+  const numCh = buffer.numberOfChannels;
+  const sr = buffer.sampleRate;
+  const len = buffer.length;
+  const byteLen = len * numCh * 2; // 16-bit
+  const ab = new ArrayBuffer(44 + byteLen);
+  const view = new DataView(ab);
+
+  function writeStr(off, str) { for(let i=0;i<str.length;i++) view.setUint8(off+i, str.charCodeAt(i)); }
+  writeStr(0,'RIFF'); view.setUint32(4, 36+byteLen, true);
+  writeStr(8,'WAVE'); writeStr(12,'fmt ');
+  view.setUint32(16,16,true); view.setUint16(20,1,true);
+  view.setUint16(22,numCh,true); view.setUint32(24,sr,true);
+  view.setUint32(28,sr*numCh*2,true); view.setUint16(32,numCh*2,true);
+  view.setUint16(34,16,true); writeStr(36,'data');
+  view.setUint32(40,byteLen,true);
+
+  let off = 44;
+  for (let i=0;i<len;i++) {
+    for (let ch=0;ch<numCh;ch++) {
+      const s = Math.max(-1,Math.min(1, buffer.getChannelData(ch)[i]));
+      view.setInt16(off, s<0?s*0x8000:s*0x7FFF, true);
+      off += 2;
+    }
+  }
+  return new Blob([ab], { type: 'audio/wav' });
 }
 
 // ---- DETECCIÓN DE PITCH ----
@@ -3241,48 +3289,34 @@ function startRecording() {
 }
 
 function stopRecording() {
-  if(VOZ.recorder&&VOZ.recorder.state!=='inactive') VOZ.recorder.stop();
-  VOZ.isRecording=false;
+  if (VOZ.recorder && VOZ.recorder.state !== 'inactive') VOZ.recorder.stop();
+  VOZ.isRecording = false;
   clearInterval(VOZ.recTimerInterval);
   document.getElementById('rec-btn').classList.remove('recording');
-  document.getElementById('rec-status').textContent='Grabación lista. Guárdala.';
+  document.getElementById('rec-status').textContent = 'Procesando efecto...';
 }
 
-function drawRecViz() {
-  if(!VOZ.lastBlob) return;
-  const canvas=document.getElementById('rec-canvas');
-  if(!canvas) return;
-  const ctx=canvas.getContext('2d');
-  canvas.width=canvas.offsetWidth*(window.devicePixelRatio||1);
-  canvas.height=canvas.offsetHeight*(window.devicePixelRatio||1);
-  ctx.scale(window.devicePixelRatio||1,window.devicePixelRatio||1);
-  const W=canvas.offsetWidth,H=canvas.offsetHeight;
-  ctx.fillStyle='#1f1f2a'; ctx.fillRect(0,0,W,H);
-  const tAC=new (window.AudioContext||window.webkitAudioContext)();
-  VOZ.lastBlob.arrayBuffer().then(ab=>tAC.decodeAudioData(ab)).then(decoded=>{
-    const data=decoded.getChannelData(0);
-    const step=Math.ceil(data.length/W);
-    ctx.beginPath(); ctx.strokeStyle='#4ecdc4'; ctx.lineWidth=1;
-    for(let i=0;i<W;i++){
-      let max=0; for(let j=0;j<step;j++){const v=Math.abs(data[i*step+j]||0);if(v>max)max=v;}
-      ctx.moveTo(i,H/2-max*(H/2)); ctx.lineTo(i,H/2+max*(H/2));
-    }
-    ctx.stroke(); tAC.close();
-  }).catch(()=>{});
-}
+async function saveRecording() {
+  if (!VOZ.lastBlob) return;
+  const name = document.getElementById('rec-name').value.trim() || 'Grabación ' + (recordings.length+1);
+  const btn = document.getElementById('btn-save-rec');
+  btn.textContent = 'Procesando...';
+  btn.disabled = true;
 
-function saveRecording() {
-  if(!VOZ.lastBlob) return;
-  const name=document.getElementById('rec-name').value.trim()||'Grabación '+(recordings.length+1);
-  const url=URL.createObjectURL(VOZ.lastBlob);
-  const dur=Math.floor((Date.now()-VOZ.recStart)/1000);
-  recordings.unshift({name,url,fx:VOZ.fx,dur,fecha:new Date().toLocaleDateString('es-ES')});
+  // Aplicar FX offline antes de guardar
+  const processedBlob = await applyFXOffline(VOZ.lastBlob, VOZ.fx);
+
+  const url = URL.createObjectURL(processedBlob);
+  const dur = Math.floor((Date.now() - VOZ.recStart) / 1000);
+  recordings.unshift({ name, url, fx: VOZ.fx, dur, fecha: new Date().toLocaleDateString('es-ES') });
   renderRecList();
-  document.getElementById('btn-save-rec').style.display='none';
-  document.getElementById('rec-name').value='';
-  document.getElementById('rec-status').textContent='¡Grabación guardada!';
+  btn.style.display = 'none';
+  btn.textContent = 'Guardar grabación';
+  btn.disabled = false;
+  document.getElementById('rec-name').value = '';
+  document.getElementById('rec-status').textContent = '¡Guardada con efecto ' + VOZ.fx + '!';
   addXP(10);
-  setTimeout(()=>document.getElementById('rec-status').textContent='Pulsa para grabar',2000);
+  setTimeout(() => document.getElementById('rec-status').textContent = 'Pulsa para grabar', 2500);
 }
 
 function renderRecList() {
@@ -3298,9 +3332,35 @@ function renderRecList() {
         <div class="rec-item-meta">${r.fecha} · Efecto: ${r.fx} · ${r.dur}s</div>
       </div>
       <audio controls src="${r.url}" style="height:32px;width:130px;flex-shrink:0"></audio>
-      <a href="${r.url}" download="${r.name}.webm" style="color:var(--accent1);font-size:18px;text-decoration:none;flex-shrink:0" title="Descargar">↓</a>
+      <a href="${r.url}" download="${r.name}.wav" style="color:var(--accent1);font-size:18px;text-decoration:none;flex-shrink:0" title="Descargar">↓</a>
     </div>
   `).join('');
+}
+
+function drawRecViz() {
+  if (!VOZ.lastBlob) return;
+  const canvas = document.getElementById('rec-canvas');
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth * (window.devicePixelRatio||1);
+  canvas.height = canvas.offsetHeight * (window.devicePixelRatio||1);
+  ctx.scale(window.devicePixelRatio||1, window.devicePixelRatio||1);
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
+  ctx.fillStyle = '#1f1f2a'; ctx.fillRect(0,0,W,H);
+  const tAC = new (window.AudioContext||window.webkitAudioContext)();
+  VOZ.lastBlob.arrayBuffer()
+    .then(ab => tAC.decodeAudioData(ab))
+    .then(decoded => {
+      const data = decoded.getChannelData(0);
+      const step = Math.ceil(data.length / W);
+      ctx.beginPath(); ctx.strokeStyle = '#4ecdc4'; ctx.lineWidth = 1;
+      for (let i=0;i<W;i++) {
+        let max=0;
+        for (let j=0;j<step;j++) { const v=Math.abs(data[i*step+j]||0); if(v>max) max=v; }
+        ctx.moveTo(i, H/2-max*(H/2)); ctx.lineTo(i, H/2+max*(H/2));
+      }
+      ctx.stroke(); tAC.close();
+    }).catch(()=>{});
 }
 // ============================================================
 
